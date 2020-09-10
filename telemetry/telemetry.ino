@@ -1,7 +1,10 @@
+// No OTA (2MB APP/2MB SPIFFS)
+
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <BluetoothSerial.h>
 #include <BLEDevice.h>
+#include <BLE2902.h>
 #include <WiFi.h>
 #include <Preferences.h>
 #include "protocol.h"
@@ -12,7 +15,7 @@
 #include "debug.h"
 
 #define SERVICE_UUID        "0000FFF0-0000-1000-8000-00805F9B34FB"
-#define CHARACTERISTIC_UUID "CHOFA4E1-8155-476F-A173-35389666BE2D"
+#define CHARACTERISTIC_UUID "0000FFF6-0000-1000-8000-00805F9B34FB"
 #define BLE_BUFFER_SIZE 20
 #define PHYSICAL_SENSOR_ID 0x19
 #define TOUCH_THRESHOLD 35
@@ -82,7 +85,7 @@ void setup() {
 
 // Bluetooth startup sequence is critical!
   if (telemetry.config.ble.mode != MODE_DISABLED) {
-    BLEDevice::init(telemetry.config.ble.name);  
+    BLEDevice::init(telemetry.config.ble.name);
     BLEDevice::setPower(ESP_PWR_LVL_P7);
   }
   if (telemetry.config.bt.mode != MODE_DISABLED) {
@@ -96,7 +99,10 @@ void setup() {
     bleServer = BLEDevice::createServer();
     BLEService* bleService = bleServer->createService(SERVICE_UUID);
     bleChar = bleService->createCharacteristic(CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+      BLECharacteristic::PROPERTY_NOTIFY);
+    BLE2902* ble2902Desc = new BLE2902();
+    ble2902Desc->setNotifications(true);
+    bleChar->addDescriptor(ble2902Desc);
     bleService->start();
     BLEAdvertising* bleAdvertising = BLEDevice::getAdvertising();
     bleAdvertising->addServiceUUID(SERVICE_UUID);
@@ -152,8 +158,8 @@ void write(uint8_t* data, uint8_t len, SerialMode mode) {
     for (int i=0; i<len && bleWritePos<BLE_BUFFER_SIZE; i++) {
       bleBuffer[bleWritePos++] = data[i];
     }
-    if (bleWritePos == BLE_BUFFER_SIZE) {
-      bleChar->setValue(bleBuffer, BLE_BUFFER_SIZE);
+    if ((mode == MODE_FILTER) || (mode != MODE_FILTER && bleWritePos == BLE_BUFFER_SIZE)) {
+      bleChar->setValue(bleBuffer, bleWritePos);
       bleChar->notify();
       bleWritePos = 0;
     }
@@ -385,16 +391,16 @@ void processSensorPacket(uint8_t physicalId, uint16_t sensorId, uint32_t sensorD
   Sensor* sensor = telemetry.updateSensor(physicalId, sensorId, sensorData);
   if (sensor != nullptr) {
     bool sent = false;
-    const uint32_t changedAge = (sensor->lastUpdated - sensor->lastChanged);
     const uint32_t processedAge = (sensor->lastUpdated - sensor->lastProcessed);
-    if ((changedAge < processedAge && processedAge > 200) // throttle frequent changes
-    || (processedAge > 500)) { // ensure everything is refreshed
+    if ((sensor->hasChangedSinceProcessed && processedAge > 200) // throttle frequent changes to no more than every 200ms
+    || (processedAge > 500)) { // ensure everything is refreshed every 500ms
       if (webEmitSensor(*sensor)) {
         sent = true;
       }
       if (mqttPublishSensor(*sensor)) {
         sent = true;
       }
+      sensor->hasChangedSinceProcessed = false;
       sensor->lastProcessed = millis();
     }
     if (sent) {
@@ -423,38 +429,57 @@ Sensor* Telemetry::updateSensor(uint8_t physicalId, uint16_t sensorId, uint32_t 
 }
 
 void Sensor::setValue(uint32_t sensorData) {
-  const uint32_t ts = millis();
   if (info) {
     if (info->unit == UNIT_GPS) {
-      int32_t v = (sensorData & 0x3FFFFFFF); // abs value
-      if (sensorData & 0x40000000) {
-        // restore sign
-        v = -v;
-      }
-      if (sensorData & 0x80000000) {
-        if (value.gps.longitude != v) {
-          value.gps.longitude = v;
-          lastChanged = ts;
-        }
-      } else {
-        if (value.gps.latitude != v) {
-          value.gps.latitude = v;
-          lastChanged = ts;
-        }
-      }
+      setGpsValue(sensorData);
     } else {
-      if (value.numeric != sensorData) {
-        value.numeric = sensorData;
-        lastChanged = ts;
-      }
+      setNumericValue(sensorData);
     }
   } else {
-    if (value.numeric != sensorData) {
-      value.numeric = sensorData;
-      lastChanged = ts;
+      setNumericValue(sensorData);
+  }
+  lastUpdated = millis();
+}
+
+void Sensor::setGpsValue(uint32_t sensorData) {
+    int32_t v = (sensorData & 0x3FFFFFFF); // abs value
+    if (sensorData & 0x40000000) {
+      // restore sign
+      v = -v;
+    }
+    if (sensorData & 0x80000000) { // is longitude
+      if (value.gps.longitude != v) {
+        lastChangedValue.gps.longitude = v;
+        hasChangedSinceProcessed = true;
+      }
+      value.gps.longitude = v;
+    } else {
+      if (value.gps.latitude != v) {
+        lastChangedValue.gps.latitude = v;
+        hasChangedSinceProcessed = true;
+      }
+      value.gps.latitude = v;
+    }
+}
+
+void Sensor::setNumericValue(uint32_t sensorData) {
+  int32_t v = sensorData;
+  if (info == nullptr || info->precision <= 1) {
+    if (value.numeric != v) {
+      lastChangedValue.numeric = v;
+      hasChangedSinceProcessed = true;
+    }
+  } else if(info->precision > 1) {
+    uint32_t diff = abs(v - lastChangedValue.numeric);
+    for (int i=0; i<info->precision; i++) {
+      diff /= 10;
+    }
+    if (diff > 0) {
+      lastChangedValue.numeric = v;
+      hasChangedSinceProcessed = true;
     }
   }
-  lastUpdated = ts;
+  value.numeric = v;
 }
 
 Sensor* Telemetry::getSensor(uint8_t physicalId, uint16_t sensorId) {
